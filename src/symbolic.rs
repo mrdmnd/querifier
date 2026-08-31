@@ -115,7 +115,7 @@ pub(crate) fn build_database(
                     else {
                         unreachable!("enum values use symbolic strings");
                     };
-                    let in_domain = or_all(
+                    let in_domain = or_many(
                         column
                             .enum_values
                             .iter()
@@ -182,7 +182,7 @@ pub(crate) fn build_database(
                         .collect::<Result<Vec<_>, _>>()?;
                     constraints.push(
                         and_all([left.live.clone(), right.live.clone()])
-                            .implies(or_all(differences)),
+                            .implies(or_many(differences)),
                     );
                 }
             }
@@ -282,7 +282,7 @@ fn encode_unique_key(
             if !primary {
                 conflict_guard.extend(both_non_null);
             }
-            constraints.push(and_all(conflict_guard).implies(and_all(equalities).not()));
+            constraints.push(and_many(conflict_guard).implies(and_many(equalities).not()));
         }
     }
     Ok(())
@@ -308,7 +308,7 @@ fn encode_foreign_key(
     let source_rows = &database.tables[source_table].rows;
     let target_rows = &database.tables[target_table].rows;
     for source in source_rows {
-        let all_non_null = and_all(
+        let all_non_null = and_many(
             source_indices
                 .iter()
                 .map(|(_, column)| source.values[*column].is_null.not()),
@@ -329,12 +329,12 @@ fn encode_foreign_key(
                         ]))
                     })
                     .collect::<Result<Vec<_>, UnsupportedReason>>()?;
-                Ok(and_all(
+                Ok(and_many(
                     std::iter::once(target.live.clone()).chain(equalities),
                 ))
             })
             .collect::<Result<Vec<_>, UnsupportedReason>>()?;
-        constraints.push(and_all([source.live.clone(), all_non_null]).implies(or_all(matches)));
+        constraints.push(and_all([source.live.clone(), all_non_null]).implies(or_many(matches)));
     }
     Ok(())
 }
@@ -349,7 +349,7 @@ fn encode_check(
     collect_predicate_tables(schema, predicate, &mut table_indices)?;
     let table_indices = table_indices.into_iter().collect::<Vec<_>>();
     for assignment in row_assignments(database, &table_indices) {
-        let guard = and_all(
+        let guard = and_many(
             assignment
                 .iter()
                 .map(|(table, row)| database.tables[*table].rows[*row].live.clone()),
@@ -797,7 +797,7 @@ fn symbolic_join(
                     .map(|column| symbolic_literal(&Value::Null, column.data_type)),
             );
             output.push(SymbolicRow {
-                live: and_all([left_row.live.clone(), or_all(matches).not()]),
+                live: and_all([left_row.live.clone(), or_many(matches).not()]),
                 values,
             });
         }
@@ -820,7 +820,7 @@ fn symbolic_join(
                 .collect::<Vec<_>>();
             values.extend(right_row.values.iter().cloned());
             output.push(SymbolicRow {
-                live: and_all([right_row.live.clone(), or_all(matches).not()]),
+                live: and_all([right_row.live.clone(), or_many(matches).not()]),
                 values,
             });
         }
@@ -851,7 +851,7 @@ fn symbolic_distinct(rows: Vec<SymbolicRow>) -> Result<Vec<SymbolicRow>, Unsuppo
             })
             .collect::<Result<Vec<_>, UnsupportedReason>>()?;
         let mut row = row.clone();
-        row.live = and_all([row.live, or_all(duplicate).not()]);
+        row.live = and_all([row.live, or_many(duplicate).not()]);
         output.push(row);
     }
     Ok(output)
@@ -968,7 +968,7 @@ fn symbolic_aggregate(
                 ]))
             })
             .collect::<Result<Vec<_>, UnsupportedReason>>()?;
-        let group_live = and_all([representative.live.clone(), or_all(duplicate).not()]);
+        let group_live = and_all([representative.live.clone(), or_many(duplicate).not()]);
         let members = input
             .iter()
             .map(|row| {
@@ -1026,7 +1026,7 @@ fn group_keys_equal(
             symbolic_value_equal(&left, &right)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(and_all(equalities))
+    Ok(and_many(equalities))
 }
 
 fn symbolic_value_equal(
@@ -1082,7 +1082,7 @@ fn symbolic_window_rank(
                         ]))
                     })
                     .collect::<Result<Vec<_>, UnsupportedReason>>()?;
-                or_all(duplicate).not()
+                or_many(duplicate).not()
             } else {
                 Bool::from_bool(true)
             };
@@ -1182,7 +1182,7 @@ fn symbolic_first_value(
         let selected = and_all([
             candidate.live.clone(),
             group_keys_equal(candidate, row, partition_by, context)?,
-            or_all(predecessors).not(),
+            or_many(predecessors).not(),
         ]);
         let value = eval_expr(expression, &candidate.values, context)?;
         result = SymbolicValue {
@@ -1243,7 +1243,7 @@ fn symbolic_sort(
             })
             .collect::<Result<Vec<_>, UnsupportedReason>>()?;
         output.push(SymbolicRow {
-            live: or_all(candidates),
+            live: or_many(candidates),
             values,
         });
     }
@@ -1294,7 +1294,7 @@ fn symbolic_slice(
             Vec::new()
         };
         output.push(SymbolicRow {
-            live: or_all(candidates),
+            live: or_many(candidates),
             values,
         });
     }
@@ -1315,7 +1315,7 @@ fn sort_keys_equal(
             symbolic_value_equal(&left, &right)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(and_all(equalities))
+    Ok(and_many(equalities))
 }
 
 fn sort_keys_before(
@@ -1365,15 +1365,23 @@ pub(crate) fn bag_equal(
     left: &SymbolicRelation,
     right: &SymbolicRelation,
 ) -> Result<Bool, UnsupportedReason> {
-    let mut formulas = vec![live_count(&left.rows).eq(live_count(&right.rows))];
+    let representatives = if left.rows.len() <= right.rows.len() {
+        &left.rows
+    } else {
+        &right.rows
+    };
+    let mut formulas = Vec::with_capacity(representatives.len() + 1);
+    formulas.push(live_count(&left.rows).eq(live_count(&right.rows)));
 
-    for representative in left.rows.iter().chain(&right.rows) {
+    // Equal total cardinality plus equal multiplicity for every live value represented on either
+    // side is sufficient: an extra value on the other side would make the totals differ.
+    for representative in representatives {
         let left_count = matching_count(&left.rows, representative)?;
         let right_count = matching_count(&right.rows, representative)?;
         formulas.push(representative.live.implies(left_count.eq(right_count)));
     }
 
-    Ok(and_all(formulas))
+    Ok(and_many(formulas))
 }
 
 pub(crate) fn list_equal(
@@ -1393,7 +1401,7 @@ pub(crate) fn list_equal(
     }
     formulas.extend(left.rows[shared..].iter().map(|row| row.live.not()));
     formulas.extend(right.rows[shared..].iter().map(|row| row.live.not()));
-    Ok(and_all(formulas))
+    Ok(and_many(formulas))
 }
 
 pub(crate) fn extract_database(
@@ -1571,7 +1579,7 @@ fn eval_expr_context(
         ),
         ExprKind::Exists { query, negated } => {
             let nested = nested_symbolic_context(context, row);
-            let exists = or_all(
+            let exists = or_many(
                 encode_relation(query, &nested)?
                     .rows
                     .into_iter()
@@ -1604,8 +1612,8 @@ fn eval_expr_context(
                 matches.push(and_all([candidate.live.clone(), equal]));
                 unknowns.push(and_all([candidate.live, unknown]));
             }
-            let matched = or_all(matches);
-            let is_null = and_all([matched.not(), or_all(unknowns)]);
+            let matched = or_many(matches);
+            let is_null = and_all([matched.not(), or_many(unknowns)]);
             Ok(SymbolicValue {
                 data_type: DataType::Boolean,
                 is_null,
@@ -1655,9 +1663,9 @@ fn symbolic_row_equal(
         inequalities.push(and_all([known, scalar_equal.not()]));
         unknowns.push(or_all([left.is_null.clone(), right.is_null.clone()]));
     }
-    let unequal = or_all(inequalities);
-    let equal = and_all(equalities);
-    let unknown = and_all([unequal.not(), or_all(unknowns)]);
+    let unequal = or_many(inequalities);
+    let equal = and_many(equalities);
+    let unknown = and_all([unequal.not(), or_many(unknowns)]);
     Ok((equal, unknown))
 }
 
@@ -1823,7 +1831,7 @@ fn symbolic_scalar_function(
     arguments: &[SymbolicValue],
     data_type: DataType,
 ) -> Result<SymbolicValue, UnsupportedReason> {
-    let is_null = or_all(arguments.iter().map(|argument| argument.is_null.clone()));
+    let is_null = or_many(arguments.iter().map(|argument| argument.is_null.clone()));
     let scalar = match function {
         ScalarFunction::Abs => match arguments {
             [
@@ -2255,7 +2263,7 @@ fn symbolic_count_distinct_row(
     for (index, (value, membership)) in values.iter().enumerate() {
         let mut live = and_all([
             membership.clone(),
-            and_all(value.iter().map(|value| value.is_null.not())),
+            and_many(value.iter().map(|value| value.is_null.not())),
         ]);
         let duplicate = values[..index]
             .iter()
@@ -2265,7 +2273,7 @@ fn symbolic_count_distinct_row(
                 Ok(and_all([previous_valid.clone(), equal]))
             })
             .collect::<Result<Vec<_>, UnsupportedReason>>()?;
-        live = and_all([live, or_all(duplicate).not()]);
+        live = and_all([live, or_many(duplicate).not()]);
         valid.push(live);
     }
     Ok(SymbolicValue {
@@ -2325,7 +2333,7 @@ fn symbolic_aggregate_value(
                     ]))
                 })
                 .collect::<Result<Vec<_>, UnsupportedReason>>()?;
-            live = and_all([live, or_all(duplicate).not()]);
+            live = and_all([live, or_many(duplicate).not()]);
         }
         valid.push(live);
     }
@@ -2632,7 +2640,7 @@ fn row_values_equal(left: &SymbolicRow, right: &SymbolicRow) -> Result<Bool, Uns
             Ok(or_all([both_null, both_values]))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(and_all(equalities))
+    Ok(and_many(equalities))
 }
 
 fn scalar_equal(left: &SymbolicScalar, right: &SymbolicScalar) -> Result<Bool, UnsupportedReason> {
@@ -2681,7 +2689,15 @@ fn int_sum(values: Vec<Int>) -> Int {
     }
 }
 
-fn and_all<I>(values: I) -> Bool
+fn and_all<const N: usize>(values: [Bool; N]) -> Bool {
+    match values.as_slice() {
+        [] => Bool::from_bool(true),
+        [value] => value.clone(),
+        _ => Bool::and(&values),
+    }
+}
+
+fn and_many<I>(values: I) -> Bool
 where
     I: IntoIterator<Item = Bool>,
 {
@@ -2693,7 +2709,15 @@ where
     }
 }
 
-fn or_all<I>(values: I) -> Bool
+fn or_all<const N: usize>(values: [Bool; N]) -> Bool {
+    match values.as_slice() {
+        [] => Bool::from_bool(false),
+        [value] => value.clone(),
+        _ => Bool::or(&values),
+    }
+}
+
+fn or_many<I>(values: I) -> Bool
 where
     I: IntoIterator<Item = Bool>,
 {

@@ -205,11 +205,11 @@ impl Verifier {
                 Err(reason) => return reason.into(),
             };
 
-        let schema_solver = Solver::new();
+        let solver = Solver::new();
         for constraint in &schema_constraints {
-            schema_solver.assert(constraint);
+            solver.assert(constraint);
         }
-        match schema_solver.check() {
+        match solver.check() {
             SatResult::Unsat => {
                 return UnsupportedReason::new(
                     UnsupportedKind::InvalidSchema,
@@ -217,7 +217,7 @@ impl Verifier {
                 )
                 .into();
             }
-            SatResult::Unknown => return solver_unknown(&schema_solver).into(),
+            SatResult::Unknown => return solver_unknown(&solver).into(),
             SatResult::Sat => {}
         }
 
@@ -238,10 +238,6 @@ impl Verifier {
             Err(reason) => return reason.into(),
         };
 
-        let solver = Solver::new();
-        for constraint in &schema_constraints {
-            solver.assert(constraint);
-        }
         solver.assert(equal.not());
 
         match solver.check() {

@@ -398,6 +398,23 @@ fn models_distinct_and_set_multiplicities() {
 }
 
 #[test]
+fn bag_comparison_can_use_the_smaller_relation_as_representatives() {
+    let schema = Schema::new([Table::new(
+        "items",
+        [Column::nullable("value", DataType::Integer)],
+    )]);
+    let verifier = Verifier::default();
+    let short = "SELECT value FROM items";
+    let long_equivalent = "SELECT value FROM items UNION ALL SELECT value FROM items WHERE FALSE";
+    let long_with_duplicates = "SELECT value FROM items UNION ALL SELECT value FROM items";
+
+    assert_true(verifier.verify(&schema, short, long_equivalent), 2);
+    assert_true(verifier.verify(&schema, long_equivalent, short), 2);
+    expect_false(verifier.verify(&schema, short, long_with_duplicates));
+    expect_false(verifier.verify(&schema, long_with_duplicates, short));
+}
+
+#[test]
 fn supports_outer_join_symmetry_and_null_extension() {
     let schema = Schema::new([
         Table::new(

@@ -2,6 +2,7 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::env;
+use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use querifier::{
@@ -76,25 +77,213 @@ struct Coverage {
     bounded_true: usize,
     false_with_witness: usize,
     adapter_unsupported: usize,
+    internal_errors: usize,
     resource_retries: usize,
     recovered_by_retry: usize,
     unsupported_by_kind: BTreeMap<&'static str, usize>,
     unsupported_reasons: BTreeMap<String, usize>,
     false_examples: Vec<String>,
+    internal_examples: Vec<String>,
     unsupported_examples: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug)]
+struct SlowRecord {
+    runtime: Duration,
+    corpus_index: usize,
+    file: String,
+    record_index: usize,
+}
+
+const PROGRESS_BAR_WIDTH: usize = 30;
+
+struct ProgressReporter {
+    total: usize,
+    update_every: usize,
+    started: Instant,
+    interactive: bool,
+}
+
+impl ProgressReporter {
+    fn new(total: usize) -> Self {
+        Self {
+            total,
+            update_every: env_usize("QUERIFIER_LEETCODE_PROGRESS_EVERY", 100).max(1),
+            started: Instant::now(),
+            interactive: io::stderr().is_terminal(),
+        }
+    }
+
+    fn update(&self, completed: usize) {
+        if !completed.is_multiple_of(self.update_every) && completed != self.total {
+            return;
+        }
+
+        let elapsed = self.started.elapsed();
+        let records_per_second = completed as f64 / elapsed.as_secs_f64();
+        let remaining = self.total.saturating_sub(completed);
+        let eta = if records_per_second.is_finite() && records_per_second > 0.0 {
+            Duration::from_secs_f64(remaining as f64 / records_per_second)
+        } else {
+            Duration::ZERO
+        };
+        let filled = completed.saturating_mul(PROGRESS_BAR_WIDTH) / self.total;
+        let bar = format!(
+            "{}{}",
+            "#".repeat(filled),
+            "-".repeat(PROGRESS_BAR_WIDTH - filled)
+        );
+        let line = format!(
+            "LeetCode [{bar}] {completed}/{total} ({percent:5.1}%) \
+             {records_per_second:6.1} records/s elapsed={elapsed} ETA={eta}",
+            total = self.total,
+            percent = completed as f64 * 100.0 / self.total as f64,
+            elapsed = format_duration(elapsed),
+            eta = format_duration(eta),
+        );
+        let mut stderr = io::stderr().lock();
+        if self.interactive {
+            write!(stderr, "\r{line}").expect("writing LeetCode progress should succeed");
+            if completed == self.total {
+                writeln!(stderr).expect("finishing LeetCode progress should succeed");
+            }
+        } else {
+            writeln!(stderr, "{line}").expect("writing LeetCode progress should succeed");
+        }
+        stderr
+            .flush()
+            .expect("flushing LeetCode progress should succeed");
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3_600;
+    let minutes = total_seconds % 3_600 / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+fn selected_record_indices(record_count: usize) -> (Vec<usize>, String) {
+    let sample_size = env_usize("QUERIFIER_LEETCODE_SAMPLE_SIZE", 0).min(record_count);
+    if sample_size > 0 {
+        let indices = (0..sample_size)
+            .map(|position| ((position * 2 + 1) * record_count) / (sample_size * 2))
+            .collect();
+        return (
+            indices,
+            format!("evenly spaced sample of {sample_size}/{record_count} records"),
+        );
+    }
+
+    let start = env_usize("QUERIFIER_LEETCODE_START", 0).min(record_count);
+    let limit = env_usize("QUERIFIER_LEETCODE_LIMIT", 100);
+    let end = start.saturating_add(limit).min(record_count);
+    assert!(start < end, "the selected corpus shard is empty");
+    ((start..end).collect(), format!("records {start}..{end}"))
+}
+
+const RUNTIME_BUCKET_LIMITS_MS: [f64; 12] = [
+    1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_000.0, 5_000.0, 10_000.0,
+];
+const RUNTIME_BUCKET_LABELS: [&str; 13] = [
+    "<1ms",
+    "1-5ms",
+    "5-10ms",
+    "10-25ms",
+    "25-50ms",
+    "50-100ms",
+    "100-250ms",
+    "250-500ms",
+    "500ms-1s",
+    "1-2s",
+    "2-5s",
+    "5-10s",
+    ">=10s",
+];
+
+fn percentile(sorted_values: &[f64], percentage: usize) -> f64 {
+    let rank = sorted_values
+        .len()
+        .saturating_mul(percentage)
+        .div_ceil(100)
+        .saturating_sub(1)
+        .min(sorted_values.len() - 1);
+    sorted_values[rank]
+}
+
+fn print_runtime_distribution(bound: usize, runtimes: &[Duration]) {
+    assert!(!runtimes.is_empty(), "runtime distribution cannot be empty");
+    let mut runtime_ms: Vec<f64> = runtimes
+        .iter()
+        .map(|runtime| runtime.as_secs_f64() * 1_000.0)
+        .collect();
+    runtime_ms.sort_by(f64::total_cmp);
+
+    let total_ms = runtime_ms.iter().sum::<f64>();
+    let mean_ms = total_ms / runtime_ms.len() as f64;
+    let mut bucket_counts = [0_usize; RUNTIME_BUCKET_LABELS.len()];
+    for runtime in &runtime_ms {
+        let bucket = RUNTIME_BUCKET_LIMITS_MS
+            .iter()
+            .position(|limit| runtime < limit)
+            .unwrap_or(RUNTIME_BUCKET_LIMITS_MS.len());
+        bucket_counts[bucket] += 1;
+    }
+    let histogram: Vec<(&str, usize)> = RUNTIME_BUCKET_LABELS
+        .iter()
+        .copied()
+        .zip(bucket_counts)
+        .collect();
+
+    println!(
+        "LeetCode runtime distribution: bound={bound}, count={}, \
+         mean_ms={mean_ms:.3}, p50_ms={:.3}, p75_ms={:.3}, p90_ms={:.3}, \
+         p95_ms={:.3}, p99_ms={:.3}, max_ms={:.3}, total_ms={total_ms:.3}, \
+         histogram={histogram:?}",
+        runtime_ms.len(),
+        percentile(&runtime_ms, 50),
+        percentile(&runtime_ms, 75),
+        percentile(&runtime_ms, 90),
+        percentile(&runtime_ms, 95),
+        percentile(&runtime_ms, 99),
+        runtime_ms[runtime_ms.len() - 1],
+    );
+}
+
+fn print_slow_records(slow_records: &mut [SlowRecord]) {
+    if slow_records.is_empty() {
+        return;
+    }
+
+    slow_records.sort_by_key(|record| std::cmp::Reverse(record.runtime));
+    let limit = env_usize("QUERIFIER_LEETCODE_SLOW_LIMIT", slow_records.len());
+    for record in slow_records.iter().take(limit) {
+        println!(
+            "LeetCode slow record: runtime_ms={:.3}, corpus_index={}, file={:?}, record_index={}",
+            record.runtime.as_secs_f64() * 1_000.0,
+            record.corpus_index,
+            record.file,
+            record.record_index,
+        );
+    }
 }
 
 #[test]
 #[ignore = "large opt-in corpus benchmark; configure with QUERIFIER_LEETCODE_* variables"]
 fn run_leetcode_corpus_shard() {
     let records = load_corpus().expect("the vendored VeriEQL corpus should load");
-    let start = env_usize("QUERIFIER_LEETCODE_START", 0).min(records.len());
-    let limit = env_usize("QUERIFIER_LEETCODE_LIMIT", 100);
-    let end = start.saturating_add(limit).min(records.len());
-    assert!(start < end, "the selected corpus shard is empty");
+    let (record_indices, selection) = selected_record_indices(records.len());
+    let bound = env_usize("QUERIFIER_LEETCODE_BOUND", 1);
+    let allow_internal_errors = env_bool("QUERIFIER_LEETCODE_ALLOW_INTERNAL_ERRORS", false);
+    let slow_threshold = Duration::from_millis(env_u64("QUERIFIER_LEETCODE_SLOW_MS", 0));
 
     let options = VerifyOptions {
-        max_rows_per_table: env_usize("QUERIFIER_LEETCODE_BOUND", 1),
+        max_rows_per_table: bound,
         timeout: Duration::from_millis(env_u64("QUERIFIER_LEETCODE_TIMEOUT_MS", 2_000)),
         max_intermediate_rows: env_usize("QUERIFIER_LEETCODE_MAX_ROWS", 10_000),
         ordering_policy: if env_bool("QUERIFIER_LEETCODE_IGNORE_TOP_LEVEL_ORDER", true) {
@@ -123,29 +312,56 @@ fn run_leetcode_corpus_shard() {
     });
     let mut coverage = Coverage::default();
     let started = Instant::now();
-    for record in &records[start..end] {
-        run_record(record, &verifier, retry_verifier.as_ref(), &mut coverage);
+    let progress = ProgressReporter::new(record_indices.len());
+    let mut runtimes = Vec::with_capacity(record_indices.len());
+    let mut slow_records = Vec::new();
+    for (offset, record_index) in record_indices.iter().enumerate() {
+        let record_started = Instant::now();
+        let record = &records[*record_index];
+        run_record(
+            record,
+            &verifier,
+            retry_verifier.as_ref(),
+            allow_internal_errors,
+            &mut coverage,
+        );
+        let runtime = record_started.elapsed();
+        runtimes.push(runtime);
+        if slow_threshold > Duration::ZERO && runtime >= slow_threshold {
+            slow_records.push(SlowRecord {
+                runtime,
+                corpus_index: *record_index,
+                file: record.file.clone(),
+                record_index: record.index,
+            });
+        }
+        progress.update(offset + 1);
     }
 
     println!(
-        "LeetCode records {start}..{end}: true={}, false={}, adapter_unsupported={}, retries={}, retry_recovered={}, unsupported_by_kind={:?}, unsupported_reasons={:?}, false_examples={:?}, unsupported_examples={:?}, elapsed_ms={}",
+        "LeetCode {selection}: true={}, false={}, adapter_unsupported={}, internal_errors={}, retries={}, retry_recovered={}, unsupported_by_kind={:?}, unsupported_reasons={:?}, false_examples={:?}, internal_examples={:?}, unsupported_examples={:?}, elapsed_ms={}",
         coverage.bounded_true,
         coverage.false_with_witness,
         coverage.adapter_unsupported,
+        coverage.internal_errors,
         coverage.resource_retries,
         coverage.recovered_by_retry,
         coverage.unsupported_by_kind,
         coverage.unsupported_reasons,
         coverage.false_examples,
+        coverage.internal_examples,
         coverage.unsupported_examples,
         started.elapsed().as_millis(),
     );
+    print_runtime_distribution(bound, &runtimes);
+    print_slow_records(&mut slow_records);
 }
 
 fn run_record(
     record: &CorpusRecord,
     verifier: &Verifier,
     retry_verifier: Option<&Verifier>,
+    allow_internal_errors: bool,
     coverage: &mut Coverage,
 ) {
     let schema = match adapt_schema(record) {
@@ -181,17 +397,26 @@ fn run_record(
             }
         }
         VerificationResult::Unsupported { reason } => {
-            assert_ne!(
-                reason.kind,
-                UnsupportedKind::Internal,
-                "internal error for {}:{}: {}",
-                record.file,
-                record.index,
-                format_args!(
-                    "{}\nleft: {}\nright: {}",
-                    reason.message, record.pair[0], record.pair[1]
-                )
-            );
+            if reason.kind == UnsupportedKind::Internal {
+                assert!(
+                    allow_internal_errors,
+                    "internal error for {}:{}: {}",
+                    record.file,
+                    record.index,
+                    format_args!(
+                        "{}\nleft: {}\nright: {}",
+                        reason.message, record.pair[0], record.pair[1]
+                    )
+                );
+                coverage.internal_errors += 1;
+                if coverage.internal_examples.len() < 5 {
+                    coverage.internal_examples.push(format!(
+                        "{}:{}: {}",
+                        record.file, record.index, reason.message
+                    ));
+                }
+                return;
+            }
             *coverage
                 .unsupported_by_kind
                 .entry(reason.code())
