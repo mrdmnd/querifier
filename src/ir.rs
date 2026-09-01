@@ -1,7 +1,7 @@
 use crate::counterexample::Value;
 use crate::schema::DataType;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TypedQuery {
     pub root: Relation,
     pub semantics: QuerySemantics,

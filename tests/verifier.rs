@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use querifier::{
-    CoercionPolicy, Column, ColumnRef, ConstraintComparison, ConstraintOperand,
+    BoundSearchOrder, CoercionPolicy, Column, ColumnRef, ConstraintComparison, ConstraintOperand,
     ConstraintPredicate, Counterexample, DataType, GroupingPolicy, IntegrityConstraint,
     OrderingPolicy, Schema, Table, UnsupportedKind, VerificationResult, Verifier, VerifyOptions,
 };
@@ -326,10 +326,126 @@ fn rejects_inconsistent_generic_constraints() {
             right: ConstraintOperand::literal(querifier::Value::Integer(2)),
         },
     });
-    expect_unsupported(
-        Verifier::default().verify(&schema, "SELECT id FROM items", "SELECT id FROM items"),
-        UnsupportedKind::InvalidSchema,
+    let report = Verifier::default().verify_with_metrics(
+        &schema,
+        "SELECT id FROM items",
+        "SELECT id FROM items",
     );
+    expect_unsupported(report.result, UnsupportedKind::InvalidSchema);
+    assert_eq!(report.counters.identical_plan_fast_paths, 0);
+
+    let prepared: Result<(), _> = Verifier::default().with_prepared(&schema, |_| {
+        panic!("an inconsistent schema must not enter the prepared callback")
+    });
+    assert_eq!(
+        prepared
+            .expect_err("preparation should reject the schema")
+            .kind,
+        UnsupportedKind::InvalidSchema
+    );
+}
+
+#[test]
+fn identical_lowered_plans_skip_query_encoding_after_schema_check() {
+    let schema = basic_schema(true);
+    let verifier = Verifier::default();
+    let identical_pairs = [
+        (
+            "SELECT id, value FROM items WHERE flag",
+            "SELECT id, value FROM items WHERE flag",
+        ),
+        (
+            "SELECT id, value FROM items WHERE flag",
+            "\n  SELECT id, value\n  FROM items\n  WHERE flag\n",
+        ),
+    ];
+
+    for (left, right) in identical_pairs {
+        let report = verifier.verify_with_metrics(&schema, left, right);
+        assert_true(report.result, 2);
+        assert_eq!(report.counters.identical_plan_fast_paths, 1);
+        assert_eq!(report.counters.left_relation_rows, 0);
+        assert_eq!(report.counters.right_relation_rows, 0);
+        assert_eq!(report.counters.matching_count_formulas, 0);
+    }
+
+    let fallback = verifier.verify_with_metrics(
+        &schema,
+        "SELECT id FROM items WHERE flag",
+        "SELECT id FROM items WHERE NOT NOT flag",
+    );
+    assert_true(fallback.result, 2);
+    assert_eq!(fallback.counters.identical_plan_fast_paths, 0);
+    assert!(fallback.counters.left_relation_rows > 0);
+    assert!(fallback.counters.right_relation_rows > 0);
+}
+
+#[test]
+fn prepared_session_isolates_query_pair_assertions() {
+    let schema = basic_schema(true);
+    let verifier = Verifier::default();
+    let results = verifier
+        .with_prepared(&schema, |prepared| {
+            vec![
+                prepared.verify(
+                    "SELECT id FROM items WHERE value > 1",
+                    "SELECT id FROM items WHERE value > 2",
+                ),
+                prepared.verify("SELECT id FROM items", "SELECT id FROM items"),
+                prepared.verify(
+                    "SELECT id FROM items WHERE value > 2",
+                    "SELECT id FROM items WHERE value > 1",
+                ),
+                prepared
+                    .verify_with_metrics(
+                        "SELECT id FROM items WHERE flag",
+                        "SELECT id FROM items WHERE flag",
+                    )
+                    .result,
+            ]
+        })
+        .expect("the schema should be preparable");
+
+    expect_false(results[0].clone());
+    assert_true(results[1].clone(), 2);
+    expect_false(results[2].clone());
+    assert_true(results[3].clone(), 2);
+}
+
+#[test]
+fn prepared_session_results_are_stable_across_query_order() {
+    let schema = primary_key_schema();
+    let verifier = Verifier::default();
+    let verify_in_order = |reverse: bool| {
+        verifier
+            .with_prepared(&schema, |prepared| {
+                let mut pairs = [
+                    (
+                        0,
+                        "SELECT id FROM items",
+                        "SELECT id FROM items WHERE value IS NOT NULL",
+                    ),
+                    (1, "SELECT DISTINCT id FROM items", "SELECT id FROM items"),
+                    (2, "SELECT value FROM items", "SELECT value FROM items"),
+                ];
+                if reverse {
+                    pairs.reverse();
+                }
+                let mut outcomes = pairs.map(|(id, left, right)| {
+                    let outcome = match prepared.verify(left, right) {
+                        VerificationResult::True { .. } => "true",
+                        VerificationResult::False { .. } => "false",
+                        VerificationResult::Unsupported { .. } => "unsupported",
+                    };
+                    (id, outcome)
+                });
+                outcomes.sort_by_key(|(id, _)| *id);
+                outcomes
+            })
+            .expect("the schema should be preparable")
+    };
+
+    assert_eq!(verify_in_order(false), verify_in_order(true));
 }
 
 #[test]
@@ -434,27 +550,141 @@ fn supports_outer_join_symmetry_and_null_extension() {
     ]);
     let verifier = Verifier::default();
 
-    assert_true(
-        verifier.verify(
-            &schema,
-            "SELECT l.id, l.left_value, r.right_value FROM left_items l LEFT JOIN right_items r ON l.id = r.id",
-            "SELECT l.id, l.left_value, r.right_value FROM right_items r RIGHT JOIN left_items l ON l.id = r.id",
-        ),
-        2,
+    let left_right_report = verifier.verify_with_metrics(
+        &schema,
+        "SELECT l.id, l.left_value, r.right_value FROM left_items l LEFT JOIN right_items r ON l.id = r.id",
+        "SELECT l.id, l.left_value, r.right_value FROM right_items r RIGHT JOIN left_items l ON l.id = r.id",
     );
-    assert_true(
-        verifier.verify(
+    assert_true(left_right_report.result, 2);
+    assert_eq!(left_right_report.counters.on_predicate_evaluations, 8);
+    let full_join_report = verifier.verify_with_metrics(
             &schema,
             "SELECT l.id, r.id, l.left_value, r.right_value FROM left_items l FULL JOIN right_items r ON l.id = r.id",
             "SELECT l.id, r.id, l.left_value, r.right_value FROM right_items r FULL JOIN left_items l ON l.id = r.id",
-        ),
-        2,
-    );
+        );
+    assert_true(full_join_report.result, 2);
+    assert_eq!(full_join_report.counters.base_rows, 4);
+    assert_eq!(full_join_report.counters.cartesian_product_pairs, 8);
+    assert_eq!(full_join_report.counters.on_predicate_evaluations, 8);
+    assert_eq!(full_join_report.counters.join_rows, 16);
+    assert_eq!(full_join_report.counters.left_output_width, 4);
+    assert_eq!(full_join_report.counters.right_output_width, 4);
     assert_true(
         verifier.verify(
             &schema,
             "SELECT i.id AS id FROM left_items AS i ORDER BY i.id",
             "SELECT id FROM left_items ORDER BY id",
+        ),
+        2,
+    );
+}
+
+#[test]
+fn outer_joins_preserve_rows_when_no_pairs_match() {
+    let schema = Schema::new([
+        Table::new("left_items", [Column::nullable("id", DataType::Integer)]),
+        Table::new("right_items", [Column::nullable("id", DataType::Integer)]),
+    ]);
+    let verifier = Verifier::new(VerifyOptions {
+        max_rows_per_table: 2,
+        ..VerifyOptions::default()
+    });
+
+    assert_true(
+        verifier.verify(
+            &schema,
+            "SELECT l.id, r.id FROM left_items l LEFT JOIN right_items r ON FALSE",
+            "SELECT id, NULLIF(0, 0) FROM left_items",
+        ),
+        2,
+    );
+    assert_true(
+        verifier.verify(
+            &schema,
+            "SELECT l.id, r.id FROM left_items l RIGHT JOIN right_items r ON FALSE",
+            "SELECT NULLIF(0, 0), id FROM right_items",
+        ),
+        2,
+    );
+    assert_true(
+        verifier.verify(
+            &schema,
+            "SELECT l.id, r.id FROM left_items l FULL JOIN right_items r ON FALSE",
+            "SELECT id, NULLIF(0, 0) FROM left_items UNION ALL SELECT NULLIF(0, 0), id FROM right_items",
+        ),
+        2,
+    );
+}
+
+#[test]
+fn outer_joins_handle_nullable_predicates_and_multiple_matches() {
+    let schema = Schema::new([
+        Table::new(
+            "left_items",
+            [
+                Column::nullable("id", DataType::Integer),
+                Column::nullable("flag", DataType::Boolean),
+            ],
+        ),
+        Table::new(
+            "right_items",
+            [
+                Column::nullable("id", DataType::Integer),
+                Column::nullable("flag", DataType::Boolean),
+            ],
+        ),
+    ]);
+    let verifier = Verifier::new(VerifyOptions {
+        max_rows_per_table: 2,
+        ..VerifyOptions::default()
+    });
+
+    assert_true(
+        verifier.verify(
+            &schema,
+            "SELECT l.id, r.id FROM left_items l LEFT JOIN right_items r ON l.flag AND r.flag",
+            "SELECT l.id, r.id FROM left_items l LEFT JOIN right_items r ON l.flag IS TRUE AND r.flag IS TRUE",
+        ),
+        2,
+    );
+    let report = verifier.verify_with_metrics(
+        &schema,
+        "SELECT l.id, r.id FROM left_items l LEFT JOIN right_items r ON TRUE",
+        "SELECT l.id, r.id FROM left_items l LEFT JOIN right_items r ON l.id = l.id OR l.id IS NULL",
+    );
+    assert_true(report.result, 2);
+    assert_eq!(report.counters.cartesian_product_pairs, 8);
+    assert_eq!(report.counters.on_predicate_evaluations, 8);
+}
+
+#[test]
+fn outer_join_handles_a_statically_empty_input() {
+    let schema = Schema::new([
+        Table::new("left_items", [Column::nullable("id", DataType::Integer)]),
+        Table::new("right_items", [Column::nullable("id", DataType::Integer)]),
+    ]);
+
+    assert_true(
+        Verifier::default().verify(
+            &schema,
+            "SELECT l.id, r.id FROM left_items l LEFT JOIN (SELECT id FROM right_items LIMIT 0) r ON l.id = r.id",
+            "SELECT id, NULLIF(0, 0) FROM left_items",
+        ),
+        2,
+    );
+    assert_true(
+        Verifier::default().verify(
+            &schema,
+            "SELECT l.id, r.id FROM (SELECT id FROM left_items LIMIT 0) l RIGHT JOIN right_items r ON l.id = r.id",
+            "SELECT NULLIF(0, 0), id FROM right_items",
+        ),
+        2,
+    );
+    assert_true(
+        Verifier::default().verify(
+            &schema,
+            "SELECT l.id, r.id FROM (SELECT id FROM left_items LIMIT 0) l FULL JOIN right_items r ON l.id = r.id",
+            "SELECT NULLIF(0, 0), id FROM right_items",
         ),
         2,
     );
@@ -884,6 +1114,178 @@ fn result_can_depend_on_the_row_bound() {
 }
 
 #[test]
+fn multi_bound_verification_reuses_monotonic_results() {
+    let schema = Schema::new([Table::new(
+        "items",
+        [Column::not_null("id", DataType::Integer)],
+    )]);
+    let verifier = Verifier::default();
+
+    let proofs = verifier
+        .verify_bounds(
+            &schema,
+            "SELECT id FROM items",
+            "SELECT id FROM items",
+            &[1, 2, 3, 2],
+            BoundSearchOrder::LargestFirst,
+        )
+        .expect("positive bounds should be valid");
+    assert_eq!(proofs.len(), 3);
+    assert!(proofs.iter().all(|result| result.result.is_true()));
+    assert!(proofs.iter().all(|result| result.source_bound == 3));
+    assert_eq!(
+        proofs.iter().filter(|result| result.was_solved()).count(),
+        1
+    );
+
+    let counterexamples = verifier
+        .verify_bounds(
+            &schema,
+            "SELECT id FROM items WHERE id > 1",
+            "SELECT id FROM items WHERE id > 2",
+            &[1, 2, 3],
+            BoundSearchOrder::SmallestFirst,
+        )
+        .expect("positive bounds should be valid");
+    assert!(
+        counterexamples
+            .iter()
+            .all(|result| result.result.is_false())
+    );
+    assert!(
+        counterexamples
+            .iter()
+            .all(|result| result.source_bound == 1)
+    );
+    assert_eq!(
+        counterexamples
+            .iter()
+            .filter(|result| result.was_solved())
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn multi_bound_verification_uses_witness_cardinality_for_lower_bounds() {
+    let schema = Schema::new([Table::new(
+        "items",
+        [Column::not_null("id", DataType::Integer)],
+    )]);
+    let results = Verifier::default()
+        .verify_bounds(
+            &schema,
+            "SELECT a.id FROM items a JOIN items b ON a.id <> b.id",
+            "SELECT id FROM items WHERE FALSE",
+            &[1, 2, 3],
+            BoundSearchOrder::LargestFirst,
+        )
+        .expect("positive bounds should be valid");
+
+    assert!(results[0].result.is_true());
+    assert_eq!(results[0].source_bound, 1);
+    assert!(results[1].result.is_false());
+    assert_eq!(results[1].source_bound, 2);
+    assert!(results[2].result.is_false());
+    assert_eq!(results[2].source_bound, 3);
+}
+
+#[test]
+fn multi_bound_verification_does_not_propagate_unsupported_results() {
+    let results = Verifier::default()
+        .verify_bounds(
+            &basic_schema(true),
+            "SELECT id FROM items WHERE 'abc' LIKE 'a_c'",
+            "SELECT id FROM items",
+            &[1, 2, 3],
+            BoundSearchOrder::LargestFirst,
+        )
+        .expect("positive bounds should be valid");
+
+    assert!(results.iter().all(|result| result.result.is_unsupported()));
+    assert!(results.iter().all(|result| result.was_solved()));
+    assert!(
+        Verifier::default()
+            .verify_bounds(
+                &basic_schema(true),
+                "SELECT id FROM items",
+                "SELECT id FROM items",
+                &[0, 1],
+                BoundSearchOrder::LargestFirst,
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn bound_monotonicity_holds_across_integrity_constraint_kinds() {
+    let primary_key = primary_key_schema();
+    let foreign_key = Schema::new([
+        Table::new("parents", [Column::nullable("id", DataType::Integer)]),
+        Table::new(
+            "children",
+            [Column::nullable("parent_id", DataType::Integer)],
+        ),
+    ])
+    .with_constraint(IntegrityConstraint::PrimaryKey {
+        columns: vec![ColumnRef::new("parents", "id")],
+    })
+    .with_constraint(IntegrityConstraint::ForeignKey {
+        columns: vec![ColumnRef::new("children", "parent_id")],
+        referenced_columns: vec![ColumnRef::new("parents", "id")],
+    });
+    let check = basic_schema(true).with_constraint(IntegrityConstraint::Check {
+        predicate: ConstraintPredicate::Compare {
+            op: ConstraintComparison::GreaterOrEqual,
+            left: ConstraintOperand::column("items", "id"),
+            right: ConstraintOperand::literal(querifier::Value::Integer(0)),
+        },
+    });
+    let auto_increment = Schema::new([Table::new(
+        "items",
+        [Column::nullable("id", DataType::Integer)],
+    )])
+    .with_constraint(IntegrityConstraint::AutoIncrement {
+        column: ColumnRef::new("items", "id"),
+    });
+    let consecutive = Schema::new([Table::new(
+        "items",
+        [Column::nullable("id", DataType::Integer)],
+    )])
+    .with_constraint(IntegrityConstraint::Consecutive {
+        column: ColumnRef::new("items", "id"),
+    });
+
+    for (schema, query) in [
+        (primary_key, "SELECT id FROM items"),
+        (foreign_key, "SELECT parent_id FROM children"),
+        (check, "SELECT id FROM items"),
+        (auto_increment, "SELECT id FROM items"),
+        (consecutive, "SELECT id FROM items"),
+    ] {
+        let multi = Verifier::default()
+            .verify_bounds(
+                &schema,
+                query,
+                query,
+                &[1, 2, 3],
+                BoundSearchOrder::LargestFirst,
+            )
+            .expect("positive bounds should be valid");
+        assert!(multi.iter().all(|result| result.result.is_true()));
+        assert!(multi.iter().all(|result| result.source_bound == 3));
+        for bound in 1..=3 {
+            let independent = Verifier::new(VerifyOptions {
+                max_rows_per_table: bound,
+                ..VerifyOptions::default()
+            })
+            .verify(&schema, query, query);
+            assert_true(independent, bound);
+        }
+    }
+}
+
+#[test]
 fn symbolic_tables_can_have_different_cardinalities() {
     let schema = Schema::new([
         Table::new("a", [Column::not_null("id", DataType::Integer)]),
@@ -954,6 +1356,14 @@ fn supports_correlated_exists_in_and_scalar_subqueries() {
             &schema,
             "SELECT i.id FROM items i WHERE EXISTS (SELECT j.id FROM items j WHERE j.id = i.id AND j.value > 0)",
             "SELECT id FROM items WHERE value > 0",
+        ),
+        2,
+    );
+    assert_true(
+        verifier.verify(
+            &schema,
+            "SELECT i.id FROM items i WHERE NOT EXISTS (SELECT j.id FROM items j WHERE j.id = i.id AND j.value > 0)",
+            "SELECT id FROM items WHERE value <= 0 OR value IS NULL",
         ),
         2,
     );
@@ -1037,6 +1447,48 @@ fn supports_correlated_exists_in_and_scalar_subqueries() {
         ),
         2,
     );
+}
+
+#[test]
+fn identifies_outer_independent_subqueries_for_metrics() {
+    let schema = primary_key_schema();
+    let verifier = Verifier::new(VerifyOptions {
+        max_rows_per_table: 3,
+        ..VerifyOptions::default()
+    });
+    let invariant = verifier.verify_with_metrics(
+        &schema,
+        "SELECT i.id FROM items i WHERE i.value IN (SELECT j.value FROM items j)",
+        "SELECT i.id FROM items i WHERE i.value IN (SELECT j.value FROM items j) AND TRUE",
+    );
+    assert_true(invariant.result, 3);
+    assert_eq!(invariant.counters.invariant_subquery_subtrees, 2);
+    assert_eq!(invariant.counters.nested_subquery_encodings, 6);
+
+    let correlated = verifier.verify_with_metrics(
+        &schema,
+        "SELECT i.id FROM items i WHERE EXISTS (SELECT j.id FROM items j WHERE j.id = i.id)",
+        "SELECT i.id FROM items i WHERE EXISTS (SELECT j.id FROM items j WHERE j.id = i.id) AND TRUE",
+    );
+    assert_true(correlated.result, 3);
+    assert_eq!(correlated.counters.invariant_subquery_subtrees, 0);
+    assert_eq!(correlated.counters.nested_subquery_encodings, 6);
+
+    let locally_correlated = verifier.verify_with_metrics(
+        &schema,
+        "SELECT i.id FROM items i WHERE EXISTS (SELECT j.id FROM items j WHERE EXISTS (SELECT k.id FROM items k WHERE k.id = j.id))",
+        "SELECT i.id FROM items i WHERE EXISTS (SELECT j.id FROM items j WHERE EXISTS (SELECT k.id FROM items k WHERE k.id = j.id)) AND TRUE",
+    );
+    assert_true(locally_correlated.result, 3);
+    assert_eq!(locally_correlated.counters.invariant_subquery_subtrees, 2);
+
+    let deeply_correlated = verifier.verify_with_metrics(
+        &schema,
+        "SELECT i.id FROM items i WHERE EXISTS (SELECT j.id FROM items j WHERE EXISTS (SELECT k.id FROM items k WHERE k.id = i.id))",
+        "SELECT i.id FROM items i WHERE EXISTS (SELECT j.id FROM items j WHERE EXISTS (SELECT k.id FROM items k WHERE k.id = i.id)) AND TRUE",
+    );
+    assert_true(deeply_correlated.result, 3);
+    assert_eq!(deeply_correlated.counters.invariant_subquery_subtrees, 0);
 }
 
 #[test]

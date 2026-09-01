@@ -11,6 +11,7 @@
 mod concrete;
 mod counterexample;
 mod ir;
+mod metrics;
 mod outcome;
 mod query;
 mod schema;
@@ -21,12 +22,16 @@ pub use counterexample::{
     Counterexample, CounterexampleTable, DateValue, ExactNumeric, QueryResult, Row,
     ScalarParseError, TimeValue, Value,
 };
+pub use metrics::{VerificationCounters, VerificationPhaseTimings, VerificationReport};
 pub use outcome::{UnsupportedKind, UnsupportedReason, VerificationResult};
 pub use schema::{
     Column, ColumnRef, ConstraintComparison, ConstraintOperand, ConstraintPredicate, DataType,
     IntegrityConstraint, Schema, Table,
 };
-pub use verifier::{CoercionPolicy, GroupingPolicy, OrderingPolicy, Verifier, VerifyOptions};
+pub use verifier::{
+    BoundSearchOrder, BoundVerification, CoercionPolicy, GroupingPolicy, OrderingPolicy,
+    PreparedVerifier, Verifier, VerifyOptions,
+};
 
 /// Verifies two queries with [`VerifyOptions::default`].
 #[must_use]

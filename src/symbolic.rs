@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use z3::Model;
 use z3::ast::{Bool, Int, Real, String as Z3String};
@@ -9,6 +10,7 @@ use crate::ir::{
     AggregateFunction, ArithmeticOp, ColumnMeta, CompareOp, ExprKind, JoinKind, Relation,
     RelationNode, ScalarFunction, SetOp, SortKey, TypedExpr, TypedQuery, WindowRankFunction,
 };
+use crate::metrics::{Counter, MetricsRecorder, Phase, measure};
 use crate::outcome::{UnsupportedKind, UnsupportedReason};
 use crate::schema::{
     ColumnRef, ConstraintComparison, ConstraintOperand, ConstraintPredicate, DataType,
@@ -54,7 +56,9 @@ enum SymbolicScalar {
 pub(crate) fn build_database(
     schema: &Schema,
     bound: usize,
+    metrics: Option<&MetricsRecorder>,
 ) -> Result<(SymbolicDatabase, Vec<Bool>), UnsupportedReason> {
+    let database_started = metrics.map(|_| Instant::now());
     let mut constraints = Vec::new();
     let mut tables = Vec::with_capacity(schema.tables.len());
 
@@ -136,6 +140,9 @@ pub(crate) fn build_database(
             }
             rows.push(SymbolicRow { live, values });
         }
+        if let Some(metrics) = metrics {
+            metrics.add(Counter::BaseRows, rows.len());
+        }
 
         // Row slots are interchangeable. Requiring a live prefix preserves every
         // possible bag while avoiding equivalent models with gaps in the slots.
@@ -192,7 +199,15 @@ pub(crate) fn build_database(
     }
 
     let database = SymbolicDatabase { tables };
-    encode_integrity_constraints(schema, &database, &mut constraints)?;
+    if let (Some(metrics), Some(started)) = (metrics, database_started) {
+        metrics.add_phase(Phase::SymbolicDatabaseConstruction, started.elapsed());
+    }
+    measure(metrics, Phase::SchemaConstraintConstruction, || {
+        encode_integrity_constraints(schema, &database, &mut constraints)
+    })?;
+    if let Some(metrics) = metrics {
+        metrics.set(Counter::SchemaConstraints, constraints.len());
+    }
     Ok((database, constraints))
 }
 
@@ -588,10 +603,19 @@ fn constraint_operand_type(
 pub(crate) fn encode_query(
     query: &TypedQuery,
     database: &SymbolicDatabase,
+    metrics: Option<&MetricsRecorder>,
 ) -> Result<SymbolicRelation, UnsupportedReason> {
+    if let Some(metrics) = metrics {
+        metrics.add(
+            Counter::InvariantSubquerySubtrees,
+            count_invariant_subqueries(&query.root),
+        );
+    }
     let context = SymbolicEvalContext {
         database,
         outer_rows: Vec::new(),
+        metrics,
+        nesting_depth: 0,
     };
     encode_relation(&query.root, &context)
 }
@@ -600,6 +624,322 @@ pub(crate) fn encode_query(
 struct SymbolicEvalContext<'database> {
     database: &'database SymbolicDatabase,
     outer_rows: Vec<Vec<SymbolicValue>>,
+    metrics: Option<&'database MetricsRecorder>,
+    nesting_depth: usize,
+}
+
+fn count_invariant_subqueries(relation: &Relation) -> usize {
+    let mut count = 0;
+    collect_invariant_subqueries(relation, &mut count);
+    count
+}
+
+fn collect_invariant_subqueries(relation: &Relation, count: &mut usize) {
+    match &relation.node {
+        RelationNode::Unit | RelationNode::Scan { .. } => {}
+        RelationNode::Product { left, right } => {
+            collect_invariant_subqueries(left, count);
+            collect_invariant_subqueries(right, count);
+        }
+        RelationNode::Join {
+            left, right, on, ..
+        } => {
+            collect_invariant_subqueries(left, count);
+            collect_invariant_subqueries(right, count);
+            collect_invariant_subqueries_from_expr(on, count);
+        }
+        RelationNode::Filter { input, predicate } => {
+            collect_invariant_subqueries(input, count);
+            collect_invariant_subqueries_from_expr(predicate, count);
+        }
+        RelationNode::Project { input, expressions } => {
+            collect_invariant_subqueries(input, count);
+            for expression in expressions {
+                collect_invariant_subqueries_from_expr(expression, count);
+            }
+        }
+        RelationNode::Distinct { input } | RelationNode::Slice { input, .. } => {
+            collect_invariant_subqueries(input, count);
+        }
+        RelationNode::SetOperation { left, right, .. } => {
+            collect_invariant_subqueries(left, count);
+            collect_invariant_subqueries(right, count);
+        }
+        RelationNode::Aggregate {
+            input,
+            group_by,
+            expressions,
+            having,
+        } => {
+            collect_invariant_subqueries(input, count);
+            for expression in group_by.iter().chain(expressions) {
+                collect_invariant_subqueries_from_expr(expression, count);
+            }
+            if let Some(having) = having {
+                collect_invariant_subqueries_from_expr(having, count);
+            }
+        }
+        RelationNode::Sort { input, keys } => {
+            collect_invariant_subqueries(input, count);
+            for key in keys {
+                collect_invariant_subqueries_from_expr(&key.expression, count);
+            }
+        }
+    }
+}
+
+fn collect_invariant_subqueries_from_expr(expression: &TypedExpr, count: &mut usize) {
+    match &expression.kind {
+        ExprKind::Column(_) | ExprKind::OuterColumn { .. } | ExprKind::Literal(_) => {}
+        ExprKind::Compare { left, right, .. }
+        | ExprKind::Arithmetic { left, right, .. }
+        | ExprKind::And(left, right)
+        | ExprKind::Or(left, right) => {
+            collect_invariant_subqueries_from_expr(left, count);
+            collect_invariant_subqueries_from_expr(right, count);
+        }
+        ExprKind::Not(inner)
+        | ExprKind::IsNull(inner)
+        | ExprKind::IsNotNull(inner)
+        | ExprKind::Negate(inner)
+        | ExprKind::Cast {
+            expression: inner, ..
+        } => collect_invariant_subqueries_from_expr(inner, count),
+        ExprKind::Coalesce(expressions)
+        | ExprKind::ScalarFunction {
+            arguments: expressions,
+            ..
+        }
+        | ExprKind::CountDistinctRow { expressions } => {
+            for expression in expressions {
+                collect_invariant_subqueries_from_expr(expression, count);
+            }
+        }
+        ExprKind::Case {
+            branches,
+            else_result,
+        } => {
+            for (condition, result) in branches {
+                collect_invariant_subqueries_from_expr(condition, count);
+                collect_invariant_subqueries_from_expr(result, count);
+            }
+            collect_invariant_subqueries_from_expr(else_result, count);
+        }
+        ExprKind::Aggregate { expression, .. } => {
+            if let Some(expression) = expression {
+                collect_invariant_subqueries_from_expr(expression, count);
+            }
+        }
+        ExprKind::Exists { query, .. } | ExprKind::ScalarSubquery { query } => {
+            collect_subquery_candidate(query, count);
+        }
+        ExprKind::InSubquery {
+            expressions, query, ..
+        } => {
+            for expression in expressions {
+                collect_invariant_subqueries_from_expr(expression, count);
+            }
+            collect_subquery_candidate(query, count);
+        }
+        ExprKind::WindowRank {
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for expression in partition_by {
+                collect_invariant_subqueries_from_expr(expression, count);
+            }
+            for key in order_by {
+                collect_invariant_subqueries_from_expr(&key.expression, count);
+            }
+        }
+        ExprKind::WindowAggregate {
+            expression,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            if let Some(expression) = expression {
+                collect_invariant_subqueries_from_expr(expression, count);
+            }
+            for expression in partition_by {
+                collect_invariant_subqueries_from_expr(expression, count);
+            }
+            for key in order_by {
+                collect_invariant_subqueries_from_expr(&key.expression, count);
+            }
+        }
+        ExprKind::FirstValue {
+            expression,
+            partition_by,
+            order_by,
+        } => {
+            collect_invariant_subqueries_from_expr(expression, count);
+            for expression in partition_by {
+                collect_invariant_subqueries_from_expr(expression, count);
+            }
+            for key in order_by {
+                collect_invariant_subqueries_from_expr(&key.expression, count);
+            }
+        }
+    }
+}
+
+fn collect_subquery_candidate(query: &Relation, count: &mut usize) {
+    if relation_references_external_outer_column(query, 0) {
+        collect_invariant_subqueries(query, count);
+    } else {
+        *count = count.saturating_add(1);
+    }
+}
+
+fn relation_references_external_outer_column(relation: &Relation, nested_scopes: usize) -> bool {
+    match &relation.node {
+        RelationNode::Unit | RelationNode::Scan { .. } => false,
+        RelationNode::Product { left, right } => {
+            relation_references_external_outer_column(left, nested_scopes)
+                || relation_references_external_outer_column(right, nested_scopes)
+        }
+        RelationNode::Join {
+            left, right, on, ..
+        } => {
+            relation_references_external_outer_column(left, nested_scopes)
+                || relation_references_external_outer_column(right, nested_scopes)
+                || expression_references_external_outer_column(on, nested_scopes)
+        }
+        RelationNode::Filter { input, predicate } => {
+            relation_references_external_outer_column(input, nested_scopes)
+                || expression_references_external_outer_column(predicate, nested_scopes)
+        }
+        RelationNode::Project { input, expressions } => {
+            relation_references_external_outer_column(input, nested_scopes)
+                || expressions.iter().any(|expression| {
+                    expression_references_external_outer_column(expression, nested_scopes)
+                })
+        }
+        RelationNode::Distinct { input } | RelationNode::Slice { input, .. } => {
+            relation_references_external_outer_column(input, nested_scopes)
+        }
+        RelationNode::SetOperation { left, right, .. } => {
+            relation_references_external_outer_column(left, nested_scopes)
+                || relation_references_external_outer_column(right, nested_scopes)
+        }
+        RelationNode::Aggregate {
+            input,
+            group_by,
+            expressions,
+            having,
+        } => {
+            relation_references_external_outer_column(input, nested_scopes)
+                || group_by.iter().any(|expression| {
+                    expression_references_external_outer_column(expression, nested_scopes)
+                })
+                || expressions.iter().any(|expression| {
+                    expression_references_external_outer_column(expression, nested_scopes)
+                })
+                || having.as_ref().is_some_and(|expression| {
+                    expression_references_external_outer_column(expression, nested_scopes)
+                })
+        }
+        RelationNode::Sort { input, keys } => {
+            relation_references_external_outer_column(input, nested_scopes)
+                || keys.iter().any(|key| {
+                    expression_references_external_outer_column(&key.expression, nested_scopes)
+                })
+        }
+    }
+}
+
+fn expression_references_external_outer_column(
+    expression: &TypedExpr,
+    nested_scopes: usize,
+) -> bool {
+    match &expression.kind {
+        ExprKind::Column(_) | ExprKind::Literal(_) => false,
+        ExprKind::OuterColumn { depth, .. } => *depth >= nested_scopes,
+        ExprKind::Compare { left, right, .. }
+        | ExprKind::Arithmetic { left, right, .. }
+        | ExprKind::And(left, right)
+        | ExprKind::Or(left, right) => {
+            expression_references_external_outer_column(left, nested_scopes)
+                || expression_references_external_outer_column(right, nested_scopes)
+        }
+        ExprKind::Not(inner)
+        | ExprKind::IsNull(inner)
+        | ExprKind::IsNotNull(inner)
+        | ExprKind::Negate(inner)
+        | ExprKind::Cast {
+            expression: inner, ..
+        } => expression_references_external_outer_column(inner, nested_scopes),
+        ExprKind::Coalesce(expressions)
+        | ExprKind::ScalarFunction {
+            arguments: expressions,
+            ..
+        }
+        | ExprKind::CountDistinctRow { expressions } => expressions.iter().any(|expression| {
+            expression_references_external_outer_column(expression, nested_scopes)
+        }),
+        ExprKind::Case {
+            branches,
+            else_result,
+        } => {
+            branches.iter().any(|(condition, result)| {
+                expression_references_external_outer_column(condition, nested_scopes)
+                    || expression_references_external_outer_column(result, nested_scopes)
+            }) || expression_references_external_outer_column(else_result, nested_scopes)
+        }
+        ExprKind::Aggregate { expression, .. } => expression.as_ref().is_some_and(|expression| {
+            expression_references_external_outer_column(expression, nested_scopes)
+        }),
+        ExprKind::Exists { query, .. } | ExprKind::ScalarSubquery { query } => {
+            relation_references_external_outer_column(query, nested_scopes.saturating_add(1))
+        }
+        ExprKind::InSubquery {
+            expressions, query, ..
+        } => {
+            expressions.iter().any(|expression| {
+                expression_references_external_outer_column(expression, nested_scopes)
+            }) || relation_references_external_outer_column(query, nested_scopes.saturating_add(1))
+        }
+        ExprKind::WindowRank {
+            partition_by,
+            order_by,
+            ..
+        } => {
+            partition_by.iter().any(|expression| {
+                expression_references_external_outer_column(expression, nested_scopes)
+            }) || order_by.iter().any(|key| {
+                expression_references_external_outer_column(&key.expression, nested_scopes)
+            })
+        }
+        ExprKind::WindowAggregate {
+            expression,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            expression.as_ref().is_some_and(|expression| {
+                expression_references_external_outer_column(expression, nested_scopes)
+            }) || partition_by.iter().any(|expression| {
+                expression_references_external_outer_column(expression, nested_scopes)
+            }) || order_by.iter().any(|key| {
+                expression_references_external_outer_column(&key.expression, nested_scopes)
+            })
+        }
+        ExprKind::FirstValue {
+            expression,
+            partition_by,
+            order_by,
+        } => {
+            expression_references_external_outer_column(expression, nested_scopes)
+                || partition_by.iter().any(|expression| {
+                    expression_references_external_outer_column(expression, nested_scopes)
+                })
+                || order_by.iter().any(|key| {
+                    expression_references_external_outer_column(&key.expression, nested_scopes)
+                })
+        }
+    }
 }
 
 fn encode_relation(
@@ -625,6 +965,12 @@ fn encode_relation(
         RelationNode::Product { left, right } => {
             let left = encode_relation(left, context)?;
             let right = encode_relation(right, context)?;
+            if let Some(metrics) = context.metrics {
+                metrics.add(
+                    Counter::CartesianProductPairs,
+                    left.rows.len().saturating_mul(right.rows.len()),
+                );
+            }
             symbolic_product(&left.rows, &right.rows)
         }
         RelationNode::Join {
@@ -710,7 +1056,7 @@ fn encode_relation(
             rows
         }
         RelationNode::Distinct { input } => {
-            symbolic_distinct(encode_relation(input, context)?.rows)?
+            symbolic_distinct(encode_relation(input, context)?.rows, context.metrics)?
         }
         RelationNode::SetOperation {
             op,
@@ -720,7 +1066,7 @@ fn encode_relation(
         } => {
             let left = encode_relation(left, context)?;
             let right = encode_relation(right, context)?;
-            symbolic_set_operation(*op, *all, &left.rows, &right.rows)?
+            symbolic_set_operation(*op, *all, &left.rows, &right.rows, context.metrics)?
         }
         RelationNode::Aggregate {
             input,
@@ -744,6 +1090,25 @@ fn encode_relation(
             limit,
         } => symbolic_slice(&encode_relation(input, context)?.rows, *offset, *limit)?,
     };
+    if let Some(metrics) = context.metrics {
+        let counter = match &relation.node {
+            RelationNode::Unit => Counter::UnitRows,
+            RelationNode::Scan { .. } => Counter::ScanRows,
+            RelationNode::Product { .. } => Counter::ProductRows,
+            RelationNode::Join { .. } => Counter::JoinRows,
+            RelationNode::Filter { .. } => Counter::FilterRows,
+            RelationNode::Project { .. } => Counter::ProjectRows,
+            RelationNode::Distinct { .. } => Counter::DistinctRows,
+            RelationNode::SetOperation { .. } => Counter::SetOperationRows,
+            RelationNode::Aggregate { .. } => Counter::AggregateRows,
+            RelationNode::Sort { .. } => Counter::SortRows,
+            RelationNode::Slice { .. } => Counter::SliceRows,
+        };
+        metrics.add(counter, rows.len());
+        if context.nesting_depth > 0 {
+            metrics.add(Counter::NestedRelationRows, rows.len());
+        }
+    }
     Ok(SymbolicRelation { rows })
 }
 
@@ -772,24 +1137,49 @@ fn symbolic_join(
     kind: JoinKind,
     context: &SymbolicEvalContext<'_>,
 ) -> Result<Vec<SymbolicRow>, UnsupportedReason> {
-    let mut output = symbolic_product(left, right);
-    for row in &mut output {
-        let predicate = eval_expr(on, &row.values, context)?;
-        row.live = and_all([row.live.clone(), predicate.is_true()?]);
+    let preserve_left = matches!(kind, JoinKind::Left | JoinKind::Full);
+    let preserve_right = matches!(kind, JoinKind::Right | JoinKind::Full);
+    let product_size = left.len().saturating_mul(right.len());
+    if let Some(metrics) = context.metrics {
+        metrics.add(Counter::CartesianProductPairs, product_size);
     }
 
-    if matches!(kind, JoinKind::Left | JoinKind::Full) {
-        for left_row in left {
+    let output_capacity = product_size
+        .saturating_add(if preserve_left { left.len() } else { 0 })
+        .saturating_add(if preserve_right { right.len() } else { 0 });
+    let mut output = Vec::with_capacity(output_capacity);
+    let mut predicates = Vec::with_capacity(if preserve_left || preserve_right {
+        product_size
+    } else {
+        0
+    });
+    for left_row in left {
+        for right_row in right {
+            let mut combined = symbolic_concatenate(left_row, right_row);
+            if let Some(metrics) = context.metrics {
+                metrics.increment(Counter::OnPredicateEvaluations);
+            }
+            let predicate = eval_expr(on, &combined.values, context)?.is_true()?;
+            if preserve_left || preserve_right {
+                predicates.push(predicate.clone());
+            }
+            combined.live = and_all([combined.live, predicate]);
+            output.push(combined);
+        }
+    }
+
+    if preserve_left {
+        for (left_index, left_row) in left.iter().enumerate() {
             let matches = right
                 .iter()
-                .map(|right_row| {
-                    let combined = symbolic_concatenate(left_row, right_row);
-                    Ok(and_all([
+                .enumerate()
+                .map(|(right_index, right_row)| {
+                    and_all([
                         right_row.live.clone(),
-                        eval_expr(on, &combined.values, context)?.is_true()?,
-                    ]))
+                        predicates[left_index * right.len() + right_index].clone(),
+                    ])
                 })
-                .collect::<Result<Vec<_>, UnsupportedReason>>()?;
+                .collect::<Vec<_>>();
             let mut values = left_row.values.clone();
             values.extend(
                 right_columns
@@ -802,18 +1192,18 @@ fn symbolic_join(
             });
         }
     }
-    if matches!(kind, JoinKind::Right | JoinKind::Full) {
-        for right_row in right {
+    if preserve_right {
+        for (right_index, right_row) in right.iter().enumerate() {
             let matches = left
                 .iter()
-                .map(|left_row| {
-                    let combined = symbolic_concatenate(left_row, right_row);
-                    Ok(and_all([
+                .enumerate()
+                .map(|(left_index, left_row)| {
+                    and_all([
                         left_row.live.clone(),
-                        eval_expr(on, &combined.values, context)?.is_true()?,
-                    ]))
+                        predicates[left_index * right.len() + right_index].clone(),
+                    ])
                 })
-                .collect::<Result<Vec<_>, UnsupportedReason>>()?;
+                .collect::<Vec<_>>();
             let mut values = left_columns
                 .iter()
                 .map(|column| symbolic_literal(&Value::Null, column.data_type))
@@ -838,7 +1228,10 @@ fn symbolic_concatenate(left: &SymbolicRow, right: &SymbolicRow) -> SymbolicRow 
     }
 }
 
-fn symbolic_distinct(rows: Vec<SymbolicRow>) -> Result<Vec<SymbolicRow>, UnsupportedReason> {
+fn symbolic_distinct(
+    rows: Vec<SymbolicRow>,
+    metrics: Option<&MetricsRecorder>,
+) -> Result<Vec<SymbolicRow>, UnsupportedReason> {
     let mut output = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
         let duplicate = rows[..index]
@@ -846,7 +1239,7 @@ fn symbolic_distinct(rows: Vec<SymbolicRow>) -> Result<Vec<SymbolicRow>, Unsuppo
             .map(|previous| {
                 Ok(and_all([
                     previous.live.clone(),
-                    row_values_equal(previous, row)?,
+                    row_values_equal(previous, row, metrics)?,
                 ]))
             })
             .collect::<Result<Vec<_>, UnsupportedReason>>()?;
@@ -862,29 +1255,30 @@ fn symbolic_set_operation(
     all: bool,
     left: &[SymbolicRow],
     right: &[SymbolicRow],
+    metrics: Option<&MetricsRecorder>,
 ) -> Result<Vec<SymbolicRow>, UnsupportedReason> {
     if op == SetOp::Union {
         let rows = left.iter().chain(right).cloned().collect::<Vec<_>>();
         return if all {
             Ok(rows)
         } else {
-            symbolic_distinct(rows)
+            symbolic_distinct(rows, metrics)
         };
     }
 
     let zero = Int::from_i64(0);
     let mut output = Vec::with_capacity(left.len());
     for (index, representative) in left.iter().enumerate() {
-        let right_count = matching_count(right, representative)?;
+        let right_count = matching_count(right, representative, metrics)?;
         let live = if all {
-            let rank = matching_count(&left[..=index], representative)?;
+            let rank = matching_count(&left[..=index], representative, metrics)?;
             match op {
                 SetOp::Intersect => and_all([representative.live.clone(), rank.le(&right_count)]),
                 SetOp::Except => and_all([representative.live.clone(), rank.gt(&right_count)]),
                 SetOp::Union => unreachable!("UNION returned above"),
             }
         } else {
-            let previous = matching_count(&left[..index], representative)?;
+            let previous = matching_count(&left[..index], representative, metrics)?;
             let first = previous.eq(&zero);
             match op {
                 SetOp::Intersect => {
@@ -1018,10 +1412,19 @@ fn group_keys_equal(
     group_by: &[TypedExpr],
     context: &SymbolicEvalContext<'_>,
 ) -> Result<Bool, UnsupportedReason> {
+    if let Some(metrics) = context.metrics {
+        metrics.increment(Counter::GroupKeyComparisons);
+    }
     let equalities = group_by
         .iter()
         .map(|expression| {
+            if let Some(metrics) = context.metrics {
+                metrics.increment(Counter::GroupKeyExpressionEvaluations);
+            }
             let left = eval_expr(expression, &left.values, context)?;
+            if let Some(metrics) = context.metrics {
+                metrics.increment(Counter::GroupKeyExpressionEvaluations);
+            }
             let right = eval_expr(expression, &right.values, context)?;
             symbolic_value_equal(&left, &right)
         })
@@ -1364,6 +1767,7 @@ fn ordered_value_before(
 pub(crate) fn bag_equal(
     left: &SymbolicRelation,
     right: &SymbolicRelation,
+    metrics: Option<&MetricsRecorder>,
 ) -> Result<Bool, UnsupportedReason> {
     let representatives = if left.rows.len() <= right.rows.len() {
         &left.rows
@@ -1376,8 +1780,8 @@ pub(crate) fn bag_equal(
     // Equal total cardinality plus equal multiplicity for every live value represented on either
     // side is sufficient: an extra value on the other side would make the totals differ.
     for representative in representatives {
-        let left_count = matching_count(&left.rows, representative)?;
-        let right_count = matching_count(&right.rows, representative)?;
+        let left_count = matching_count(&left.rows, representative, metrics)?;
+        let right_count = matching_count(&right.rows, representative, metrics)?;
         formulas.push(representative.live.implies(left_count.eq(right_count)));
     }
 
@@ -1387,6 +1791,7 @@ pub(crate) fn bag_equal(
 pub(crate) fn list_equal(
     left: &SymbolicRelation,
     right: &SymbolicRelation,
+    metrics: Option<&MetricsRecorder>,
 ) -> Result<Bool, UnsupportedReason> {
     let shared = left.rows.len().min(right.rows.len());
     let mut formulas = Vec::with_capacity(left.rows.len().max(right.rows.len()) * 2);
@@ -1396,7 +1801,7 @@ pub(crate) fn list_equal(
         formulas.push(left.live.eq(&right.live));
         formulas.push(
             and_all([left.live.clone(), right.live.clone()])
-                .implies(row_values_equal(left, right)?),
+                .implies(row_values_equal(left, right, metrics)?),
         );
     }
     formulas.extend(left.rows[shared..].iter().map(|row| row.live.not()));
@@ -1673,8 +2078,12 @@ fn nested_symbolic_context<'database>(
     context: &SymbolicEvalContext<'database>,
     row: &[SymbolicValue],
 ) -> SymbolicEvalContext<'database> {
+    if let Some(metrics) = context.metrics {
+        metrics.increment(Counter::NestedSubqueryEncodings);
+    }
     let mut nested = context.clone();
     nested.outer_rows.push(row.to_vec());
+    nested.nesting_depth += 1;
     nested
 }
 
@@ -2615,7 +3024,14 @@ fn compare_scalars(
     }
 }
 
-fn row_values_equal(left: &SymbolicRow, right: &SymbolicRow) -> Result<Bool, UnsupportedReason> {
+fn row_values_equal(
+    left: &SymbolicRow,
+    right: &SymbolicRow,
+    metrics: Option<&MetricsRecorder>,
+) -> Result<Bool, UnsupportedReason> {
+    if let Some(metrics) = metrics {
+        metrics.increment(Counter::RowValueComparisons);
+    }
     if left.values.len() != right.values.len() {
         return Err(internal(
             "bag comparison received rows with different widths",
@@ -2668,13 +3084,18 @@ fn live_count(rows: &[SymbolicRow]) -> Int {
 fn matching_count(
     rows: &[SymbolicRow],
     representative: &SymbolicRow,
+    metrics: Option<&MetricsRecorder>,
 ) -> Result<Int, UnsupportedReason> {
+    if let Some(metrics) = metrics {
+        metrics.increment(Counter::MatchingCountFormulas);
+        metrics.add(Counter::MatchingCountTerms, rows.len());
+    }
     let zero = Int::from_i64(0);
     let one = Int::from_i64(1);
     let terms = rows
         .iter()
         .map(|row| {
-            row_values_equal(row, representative)
+            row_values_equal(row, representative, metrics)
                 .map(|equal| and_all([row.live.clone(), equal]).ite(&one, &zero))
         })
         .collect::<Result<Vec<_>, _>>()?;
