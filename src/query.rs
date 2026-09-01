@@ -18,6 +18,7 @@ use crate::ir::{
     JoinKind, QuerySemantics, Relation, RelationNode, ScalarFunction, SetOp, SortKey, TypedExpr,
     TypedQuery, WindowRankFunction,
 };
+use crate::normalize::normalize_query;
 use crate::outcome::{UnsupportedKind, UnsupportedReason};
 use crate::schema::{DataType, IntegrityConstraint, Schema, canonical_name};
 
@@ -69,8 +70,10 @@ pub(crate) fn parse_query(
         mysql_coercions,
     };
     let (root, semantics) = lowerer.lower_query(&query)?;
-    validate_recursive_complexity(&root, max_intermediate_rows)?;
-    Ok(TypedQuery { root, semantics })
+    let mut query = TypedQuery { root, semantics };
+    normalize_query(&mut query);
+    validate_recursive_complexity(&query.root, max_intermediate_rows)?;
+    Ok(query)
 }
 
 struct Lowerer<'schema> {

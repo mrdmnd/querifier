@@ -12,6 +12,7 @@ mod concrete;
 mod counterexample;
 mod ir;
 mod metrics;
+mod normalize;
 mod outcome;
 mod query;
 mod schema;

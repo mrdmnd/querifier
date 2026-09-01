@@ -914,6 +914,99 @@ fn permissive_grouping_uses_the_first_live_symbolic_row() {
 }
 
 #[test]
+fn normalizes_piecewise_rounding_before_solver() {
+    let schema = Schema::new([Table::new(
+        "salaries",
+        [
+            Column::not_null("company_id", DataType::Integer),
+            Column::not_null("employee_id", DataType::Integer),
+            Column::not_null("employee_name", DataType::Text),
+            Column::not_null("salary", DataType::Integer),
+        ],
+    )
+    .with_primary_key(["company_id", "employee_id"])])
+    .with_constraint(IntegrityConstraint::Check {
+        predicate: ConstraintPredicate::Compare {
+            op: ConstraintComparison::Greater,
+            left: ConstraintOperand::column("salaries", "salary"),
+            right: ConstraintOperand::literal(querifier::Value::Integer(0)),
+        },
+    });
+    let verifier = Verifier::new(VerifyOptions {
+        max_rows_per_table: 1,
+        timeout: Duration::from_millis(500),
+        ..VerifyOptions::default()
+    });
+    let reference = "\
+        SELECT s.company_id, s.employee_id, s.employee_name, \
+        ROUND(CASE \
+            WHEN x.max_salary BETWEEN 1000 AND 10000 THEN s.salary * 0.76 \
+            WHEN x.max_salary > 10000 THEN s.salary * 0.51 \
+            ELSE s.salary \
+        END, 0) AS salary \
+        FROM salaries s \
+        JOIN (\
+            SELECT company_id, MAX(salary) AS max_salary \
+            FROM salaries \
+            GROUP BY company_id\
+        ) x ON s.company_id = x.company_id";
+    let candidates = [
+        "\
+            SELECT company_id, employee_id, employee_name, \
+            CASE \
+                WHEN MAX(salary) OVER (PARTITION BY company_id) < 1000 THEN salary \
+                WHEN MAX(salary) OVER (PARTITION BY company_id) BETWEEN 1000 AND 10000 \
+                    THEN ROUND(salary - 0.24 * salary, 0) \
+                ELSE ROUND(salary - 0.49 * salary, 0) \
+            END AS salary \
+            FROM salaries",
+        "\
+            WITH maximums AS (\
+                SELECT company_id, MAX(salary) AS max_salary \
+                FROM salaries \
+                GROUP BY company_id\
+            ) \
+            SELECT s.company_id, s.employee_id, s.employee_name, \
+            CASE \
+                WHEN maximums.max_salary < 1000 THEN ROUND(s.salary) \
+                WHEN maximums.max_salary BETWEEN 1000 AND 10000 \
+                    THEN ROUND(s.salary - 0.24 * s.salary, 0) \
+                ELSE ROUND(s.salary - 0.49 * s.salary, 0) \
+            END AS salary \
+            FROM salaries s \
+            JOIN maximums ON s.company_id = maximums.company_id",
+    ];
+
+    for candidate in candidates {
+        assert_true(verifier.verify(&schema, reference, candidate), 1);
+    }
+}
+
+#[test]
+fn preserves_piecewise_rounding_when_factoring_is_not_sound() {
+    let schema = Schema::new([Table::new(
+        "values_table",
+        [
+            Column::not_null("id", DataType::Integer),
+            Column::nullable("amount", DataType::Numeric),
+            Column::nullable("flag", DataType::Boolean),
+        ],
+    )
+    .with_primary_key(["id"])]);
+
+    expect_false(Verifier::default().verify(
+        &schema,
+        "SELECT CASE WHEN flag THEN ROUND(amount, 0) ELSE amount END FROM values_table",
+        "SELECT ROUND(amount, 0) FROM values_table",
+    ));
+    expect_false(Verifier::default().verify(
+        &schema,
+        "SELECT CASE WHEN flag THEN ROUND(amount, 0) ELSE ROUND(amount, 1) END FROM values_table",
+        "SELECT ROUND(amount, 0) FROM values_table",
+    ));
+}
+
+#[test]
 fn supports_exact_scalar_functions_and_casts() {
     let schema = Schema::new([Table::new(
         "values_table",
