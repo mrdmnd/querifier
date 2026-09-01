@@ -144,8 +144,8 @@ pub(crate) fn build_database(
             metrics.add(Counter::BaseRows, rows.len());
         }
 
-        // Row slots are interchangeable. Requiring a live prefix preserves every
-        // possible bag while avoiding equivalent models with gaps in the slots.
+        // Make live row slots a prefix of the fixed slot vector. This preserves
+        // every possible bag while eliminating redundant models with dead gaps.
         for adjacent in rows.windows(2) {
             constraints.push(adjacent[1].live.implies(adjacent[0].live.clone()));
         }
@@ -1777,8 +1777,9 @@ pub(crate) fn bag_equal(
     let mut formulas = Vec::with_capacity(representatives.len() + 1);
     formulas.push(live_count(&left.rows).eq(live_count(&right.rows)));
 
-    // Equal total cardinality plus equal multiplicity for every live value represented on either
-    // side is sufficient: an extra value on the other side would make the totals differ.
+    // Equal total cardinality plus matching multiplicities for the live values on the side with
+    // fewer symbolic rows is sufficient. Any unmatched value on the other side would otherwise
+    // have to replace one of those values or increase the total cardinality.
     for representative in representatives {
         let left_count = matching_count(&left.rows, representative, metrics)?;
         let right_count = matching_count(&right.rows, representative, metrics)?;

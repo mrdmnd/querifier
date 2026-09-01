@@ -36,7 +36,7 @@ pub(crate) struct Relation {
     pub node: RelationNode,
     pub columns: Vec<ColumnMeta>,
     pub max_rows: usize,
-    /// Sound functional dependencies over output column indexes.
+    /// Valid functional dependencies over output column indexes, used for strict grouping.
     pub functional_dependencies: Vec<FunctionalDependency>,
 }
 

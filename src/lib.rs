@@ -2,11 +2,13 @@
 #![deny(rust_2018_idioms)]
 #![warn(missing_debug_implementations)]
 
-//! Bounded equivalence checking for a deliberately small SQL fragment.
+//! Bounded SQL query equivalence checking.
 //!
-//! A `true` result is a proof only for databases containing at most the
-//! configured number of rows in each table. A `false` result includes a
-//! concrete counterexample and proves the queries are not equivalent.
+//! A [`VerificationResult::True`] result covers only databases containing at
+//! most the configured number of rows in each base table. Results are compared
+//! as bags unless ordering or slicing requires list comparison. A
+//! [`VerificationResult::False`] result includes a concrete counterexample and
+//! proves that the queries are not equivalent.
 
 mod concrete;
 mod counterexample;
@@ -34,7 +36,7 @@ pub use verifier::{
     PreparedVerifier, Verifier, VerifyOptions,
 };
 
-/// Verifies two queries with [`VerifyOptions::default`].
+/// Checks two queries for bounded equivalence with [`VerifyOptions::default`].
 #[must_use]
 pub fn verify(schema: &Schema, left_sql: &str, right_sql: &str) -> VerificationResult {
     Verifier::default().verify(schema, left_sql, right_sql)

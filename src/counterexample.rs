@@ -279,7 +279,10 @@ impl fmt::Display for Value {
     }
 }
 
-/// An ordered tuple of concrete values. Query result collections treat rows as a bag.
+/// An ordered tuple of concrete values.
+///
+/// The surrounding query result is compared as a bag unless ordering or slicing
+/// gives it list semantics.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Row {
     pub values: Vec<Value>,

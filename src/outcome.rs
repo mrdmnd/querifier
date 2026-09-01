@@ -71,11 +71,12 @@ impl std::error::Error for UnsupportedReason {}
 /// The three possible outcomes of bounded verification.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VerificationResult {
-    /// No counterexample exists within the configured per-table row bound.
+    /// No counterexample exists within the row bound under bag or list comparison,
+    /// as determined by the queries' ordering and slicing semantics.
     True { bound: usize },
     /// The queries differ on the included concrete database.
     False { counterexample: Counterexample },
-    /// The input or solver fell outside the implementation's supported boundary.
+    /// The query pair could not be checked within the supported semantics or resources.
     Unsupported { reason: UnsupportedReason },
 }
 

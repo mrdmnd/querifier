@@ -50,7 +50,10 @@ pub struct VerificationCounters {
     pub group_key_expression_evaluations: u64,
     pub on_predicate_evaluations: u64,
     pub nested_subquery_encodings: u64,
-    /// Maximal nested relation roots that do not depend on the surrounding query.
+    /// Uncorrelated subquery roots found before encoding.
+    ///
+    /// Correlated subquery bodies are traversed recursively instead of being
+    /// counted at their root.
     pub invariant_subquery_subtrees: u64,
     pub nested_relation_rows: u64,
     pub matching_count_formulas: u64,

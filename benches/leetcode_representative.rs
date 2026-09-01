@@ -124,8 +124,9 @@ impl CaseId {
     }
 }
 
-// Verdicts for bounds 1-3 and performance tiers at TARGET_BOUND are calibrated with the default
-// timeout. The faster feature cases protect breadth; the near- and solver-tail cases expose scaling.
+// expected_verdicts for bounds 1-3 were chosen with the benchmark's default one-second timeout.
+// PerformanceTier labels are static assignments from that profiling pass: Typical cases cover
+// feature breadth, while NearTail and SolverTail cases stress latency and solver limits.
 const REPRESENTATIVE_CASES: &[CaseId] = &[
     CaseId {
         file: "benchmark/leetcode/raw_data/175.csv",

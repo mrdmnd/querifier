@@ -1662,7 +1662,7 @@ fn rejects_pathologically_deep_nested_queries() {
 }
 
 #[test]
-fn rejects_features_outside_the_mvp() {
+fn rejects_unsupported_sql_features() {
     let schema = basic_schema(true);
     expect_unsupported(
         Verifier::default().verify(
@@ -1735,6 +1735,69 @@ fn reports_parse_name_type_and_schema_failures() {
         ),
         UnsupportedKind::InvalidSchema,
     );
+}
+
+#[test]
+fn readme_one_row_bound_hides_duplicate_behavior() {
+    let schema = Schema::new([Table::new(
+        "items",
+        [Column::nullable("value", DataType::Integer)],
+    )]);
+    let left = "SELECT value FROM items";
+    let right = "SELECT DISTINCT value FROM items";
+
+    assert_true(
+        Verifier::new(VerifyOptions {
+            max_rows_per_table: 1,
+            ..VerifyOptions::default()
+        })
+        .verify(&schema, left, right),
+        1,
+    );
+
+    let counterexample = expect_false(
+        Verifier::new(VerifyOptions {
+            max_rows_per_table: 2,
+            ..VerifyOptions::default()
+        })
+        .verify(&schema, left, right),
+    );
+    assert_eq!(counterexample.tables[0].rows.len(), 2);
+    assert_eq!(counterexample.left_result.rows.len(), 2);
+    assert_eq!(counterexample.right_result.rows.len(), 1);
+}
+
+#[test]
+fn readme_two_row_bound_hides_three_row_interaction() {
+    let schema = Schema::new([Table::new(
+        "items",
+        [Column::not_null("id", DataType::Integer)],
+    )]);
+    let left = "SELECT a.id FROM items a, items b, items c \
+                WHERE a.id < b.id AND b.id < c.id";
+    let right = "SELECT id FROM items WHERE id <> id";
+
+    for bound in [1, 2] {
+        assert_true(
+            Verifier::new(VerifyOptions {
+                max_rows_per_table: bound,
+                ..VerifyOptions::default()
+            })
+            .verify(&schema, left, right),
+            bound,
+        );
+    }
+
+    let counterexample = expect_false(
+        Verifier::new(VerifyOptions {
+            max_rows_per_table: 3,
+            ..VerifyOptions::default()
+        })
+        .verify(&schema, left, right),
+    );
+    assert_eq!(counterexample.tables[0].rows.len(), 3);
+    assert!(!counterexample.left_result.rows.is_empty());
+    assert!(counterexample.right_result.rows.is_empty());
 }
 
 #[test]

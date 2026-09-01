@@ -178,11 +178,11 @@ pub enum IntegrityConstraint {
     Check {
         predicate: ConstraintPredicate,
     },
-    /// Values strictly increase in symbolic row-slot order.
+    /// Adjacent live row slots contain increasing non-NULL integers; gaps are allowed.
     AutoIncrement {
         column: ColumnRef,
     },
-    /// Adjacent live row slots contain adjacent integer values.
+    /// Adjacent live row slots contain non-NULL consecutive integer values.
     Consecutive {
         column: ColumnRef,
     },

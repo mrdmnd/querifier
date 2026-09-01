@@ -274,7 +274,7 @@ fn print_slow_records(slow_records: &mut [SlowRecord]) {
 }
 
 #[test]
-#[ignore = "large opt-in corpus benchmark; configure with QUERIFIER_LEETCODE_* variables"]
+#[ignore = "opt-in corpus shard test (100 records by default); run with --ignored and optional QUERIFIER_LEETCODE_* settings"]
 fn run_leetcode_corpus_shard() {
     let records = load_corpus().expect("the vendored VeriEQL corpus should load");
     let (record_indices, selection) = selected_record_indices(records.len());

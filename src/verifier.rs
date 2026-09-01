@@ -18,7 +18,10 @@ use crate::symbolic::{
 /// Controls how a top-level `ORDER BY` affects query equivalence.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum OrderingPolicy {
-    /// Require both queries to have an ordered result contract.
+    /// Preserve top-level ordering.
+    ///
+    /// Two unordered, unsliced queries are compared as bags. Two ordered or
+    /// sliced queries are compared as lists. A bag-to-list comparison is unsupported.
     #[default]
     Strict,
     /// Ignore top-level `ORDER BY` and compare result bags when neither query is sliced.
@@ -57,10 +60,10 @@ pub enum CoercionPolicy {
 /// Order used when solving a set of row bounds.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BoundSearchOrder {
-    /// Solve the largest unresolved bound first. A proof resolves every smaller bound.
+    /// Solve the largest unresolved bound first and propagate `True` to smaller bounds.
     #[default]
     LargestFirst,
-    /// Solve the smallest unresolved bound first. A counterexample resolves every larger bound.
+    /// Solve the smallest unresolved bound first and propagate witnesses to larger bounds.
     SmallestFirst,
 }
 
@@ -87,9 +90,11 @@ pub struct VerifyOptions {
     pub max_rows_per_table: usize,
     /// Wall-clock limit passed to Z3 for each solver check.
     pub timeout: Duration,
-    /// Maximum number of symbolic rows produced by a query's Cartesian product.
+    /// Maximum symbolic rows in an intermediate relation.
+    ///
+    /// This limit also determines the budget for recursively expanded query work.
     pub max_intermediate_rows: usize,
-    /// Policy for a top-level `ORDER BY` present on only one side.
+    /// Policy for whether unsliced top-level `ORDER BY` affects equivalence.
     pub ordering_policy: OrderingPolicy,
     /// Policy for non-aggregate expressions in grouped queries.
     pub grouping_policy: GroupingPolicy,
@@ -132,11 +137,12 @@ impl Drop for SolverScope<'_> {
     }
 }
 
-/// A thread-affine verification session with a pre-encoded schema and symbolic database.
+/// A verification session tied to one Z3 context, with a pre-encoded schema and database.
 ///
 /// Instances are only available within [`Verifier::with_prepared`] because Z3 objects
-/// must remain in the context that created them. Long-running callers should periodically
-/// return from `with_prepared` and create a fresh session so Z3 can release accumulated state.
+/// must remain in the thread and context that created them. Long-running callers should
+/// periodically return from `with_prepared` and create a fresh session so Z3 can release
+/// accumulated state.
 #[derive(Debug)]
 pub struct PreparedVerifier<'a> {
     verifier: &'a Verifier,
@@ -204,7 +210,7 @@ impl Verifier {
         })
     }
 
-    /// Searches for a database that makes the two typed query result bags differ.
+    /// Checks bounded equivalence and returns a counterexample when the results differ.
     #[must_use]
     pub fn verify(&self, schema: &Schema, left_sql: &str, right_sql: &str) -> VerificationResult {
         self.verify_internal(schema, left_sql, right_sql, None)
